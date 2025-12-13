@@ -1,0 +1,43 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+ipch/
+*.pch
+*.pdb
+*.iobj
+*.ipdb
+*.obj
+*.tlog
+*.log
+*.lastbuildstate
+*.cachefile
+*.ilk
+*.idb
+*.exp
+*.tmp
+
+# Build outputs
+Output/
+x64/
+**/Debug/
+**/Release/
+**/ARM64/
+*.exe
+*.dll
+*.8bi
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xcworkspace
+build/
+
+# OS artifacts
+Thumbs.db
+.DS_Store
