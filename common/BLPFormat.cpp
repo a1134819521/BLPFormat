@@ -1084,8 +1084,6 @@ static void ResizeImage(uint8* src, int srcW, int srcH, uint8* dst, int dstW, in
 
 static void DoWriteStart (void)
 {
-    // LogToFile("DoWriteStart: Entering");
-
 	BLP_HEADER header;
 	memset(&header, 0, sizeof(BLP_HEADER));
 	int32 done;
@@ -1163,26 +1161,27 @@ static void DoWriteStart (void)
             uint8* dstBase = gData->imageBuffer + (row * width * 4);
             
             for (int col = 0; col < width; col++) {
-                // Map Plane to BGRA for processing
-                // Plane 0 (R) -> Index 2 (B) ?? No, we want RGB in memory for simplicity, 
-                // but we need to prepare for CMYK (Inverted BGRA) writing.
-                // Let's store as RGBA in imageBuffer for now.
-                
-                int dstIdx = 0;
+                // Map Plane to RGBA for processing
+                int dstIdx = -1;
+                int targetAlphaPlane = 3;
+                // If we have extra channels (planes > 4) and one of them is transparency (usually index 3),
+                // we prefer the explicit Alpha channel (usually index 4) over the transparency mask.
+                if (planes > 4 && gFormatRecord->transparencyPlane == 3) targetAlphaPlane = 4;
+
                 if (plane == 0) dstIdx = 0; // R -> R
                 else if (plane == 1) dstIdx = 1; // G -> G
                 else if (plane == 2) dstIdx = 2; // B -> B
-                else if (plane == 3) dstIdx = 3; // A -> A
+                else if (plane == targetAlphaPlane) dstIdx = 3; // A -> A
                 
                 if (planes == 1) {
                     uint8 val = srcRow[col];
                     dstBase[col*4 + 0] = val;
                     dstBase[col*4 + 1] = val;
                     dstBase[col*4 + 2] = val;
-                    dstBase[col*4 + 3] = 0; // Inverted Alpha (Opaque)
-                } else {
+                    dstBase[col*4 + 3] = 255; 
+                } else if (dstIdx != -1) {
                     dstBase[col*4 + dstIdx] = srcRow[col];
-                    if (planes == 3 && plane == 0) dstBase[col*4 + 3] = 0; // Inverted Alpha (Opaque)
+                    if (planes == 3 && plane == 0) dstBase[col*4 + 3] = 255;
                 }
             }
 			
@@ -1200,7 +1199,7 @@ static void DoWriteStart (void)
     header.Width = width;
     header.Height = height;
     header.Compression = BLP_COMPRESSION_JPEG;
-    header.alpha_bits = (planes == 4) ? 8 : 0;
+    header.alpha_bits = (planes >= 4) ? 8 : 0;
     header.extra = 4; // Team color flag, usually 4 or 5
     header.has_mipMaps = 1; // Always has mipmaps structure
 
@@ -1212,13 +1211,11 @@ static void DoWriteStart (void)
                              0);
 	if (*gResult != noErr) return;
     
-    // LogToFile("DoWriteStart: sizeof(BLP_HEADER)", sizeof(BLP_HEADER));
     WriteSome(sizeof(BLP_HEADER), &header);
 
     // Write Header Size (0)
     uint32 jpgHeaderSize = 0;
     WriteSome(4, &jpgHeaderSize);
-    // LogToFile("DoWriteStart: Wrote jpgHeaderSize 0");
 
     uint32 currentOffset = sizeof(BLP_HEADER) + 4;
     
@@ -1296,18 +1293,6 @@ static void DoWriteStart (void)
         jpeg_finish_compress(&cinfo);
         jpeg_destroy_compress(&cinfo);
         
-        // LogToFile("DoWriteStart: jpgSize", (int)jpgSize);
-        if (jpgSize > 4) {
-             int b0 = jpgBuffer[0];
-             int b1 = jpgBuffer[1];
-             int b2 = jpgBuffer[2];
-             int b3 = jpgBuffer[3];
-             // Log as hex integer
-             char msg[64];
-             sprintf(msg, "DoWriteStart: Bytes 0-3: %02X %02X %02X %02X", b0, b1, b2, b3);
-             // LogToFile(msg);
-        }
-
         // Write Data
         header.Offset[mipLevel] = currentOffset;
         header.Size[mipLevel] = (uint32)jpgSize;
@@ -1359,8 +1344,6 @@ static void DoWriteStart (void)
                              0);
 	if (*gResult != noErr) return;
     WriteSome(sizeof(BLP_HEADER), &header);
-
-    // LogToFile("DoWriteStart: Write Finished");
     
     if (gData->imageBuffer) {
         free(gData->imageBuffer);
