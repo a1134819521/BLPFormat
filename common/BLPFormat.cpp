@@ -89,6 +89,9 @@ static void WriteRow (Ptr pixelData);
 static void DisposeImageResources (void);
 static void SwapRow(int32 rowBytes, Ptr pixelData);
 
+static bool IsDirectAlphaAllZero(int32 width, int32 height);
+static bool DecodeJPEGMip0ToImageBuffer(int32 width, int32 height, bool& outHasAlpha, bool& outAlphaAllZero);
+
 static VPoint GetFormatImageSize(void);
 static void SetFormatImageSize(VPoint inPoint);
 static void SetFormatTheRect(VRect inRect);
@@ -489,11 +492,14 @@ static void DoReadStart (void)
         if (gData->blpHeader.alpha_bits > 0)
         {
              gFormatRecord->imageMode = plugInModeRGBColor;
-             // Return alpha as a separate Alpha channel (not as transparency).
-             // This makes Photoshop show an "Alpha 1" channel instead of using it
-             // as the document's transparency.
-             gFormatRecord->planes = 4;
-             gFormatRecord->transparencyPlane = -1;
+
+           // 仅当 alpha 通道“纯透明(全 0)”时，才把它作为独立 Alpha 通道返回。
+           // 否则将其作为透明度使用（Photoshop 会把它当作文档透明度，而不是额外通道）。
+           bool alphaAllZero = IsDirectAlphaAllZero(imageSize.h, imageSize.v);
+           if (*gResult != noErr) return;
+
+           gFormatRecord->planes = 4;
+           gFormatRecord->transparencyPlane = alphaAllZero ? -1 : 3;
         }
         else
         {
@@ -520,9 +526,32 @@ static void DoReadStart (void)
     else if (gData->blpHeader.Compression == BLP_COMPRESSION_JPEG)
     {
         gFormatRecord->imageMode = plugInModeRGBColor;
-        // Same behavior for JPEG-compressed BLP: expose alpha as a separate channel.
-        gFormatRecord->planes = 4;
-        gFormatRecord->transparencyPlane = -1;
+
+        // JPEG BLP 需要先判断 alpha 是否“纯透明(全 0)”，以决定是否独立为 Alpha 通道。
+        bool hasAlpha = false;
+        bool alphaAllZero = false;
+        if (gData->imageBuffer == NULL)
+        {
+            if (!DecodeJPEGMip0ToImageBuffer(imageSize.h, imageSize.v, hasAlpha, alphaAllZero))
+                return;
+        }
+        else
+        {
+            // 已经有解码好的 buffer（理论上不会发生在这里），保守处理：认为有 alpha 且不全 0。
+            hasAlpha = true;
+            alphaAllZero = false;
+        }
+
+        if (hasAlpha)
+        {
+            gFormatRecord->planes = 4;
+            gFormatRecord->transparencyPlane = alphaAllZero ? -1 : 3;
+        }
+        else
+        {
+            gFormatRecord->planes = 3;
+            gFormatRecord->transparencyPlane = -1;
+        }
     }
     else
     {
@@ -534,6 +563,56 @@ static void DoReadStart (void)
 	
 	gFormatRecord->imageRsrcSize = 0;
     gFormatRecord->imageRsrcData = NULL;
+}
+
+static bool IsDirectAlphaAllZero(int32 width, int32 height)
+{
+    if (*gResult != noErr)
+        return false;
+
+    if (gData->blpHeader.Compression != BLP_COMPRESSION_DIRECT || gData->blpHeader.alpha_bits == 0)
+        return true;
+
+    const uint32 alphaBits = gData->blpHeader.alpha_bits;
+    const uint64 pixels = static_cast<uint64>(width) * static_cast<uint64>(height);
+    const uint64 alphaSize = (pixels * static_cast<uint64>(alphaBits) + 7ull) / 8ull;
+
+    // Direct 模式下 alpha 数据紧跟在 index 数据后面。
+    const uint64 alphaOffset = static_cast<uint64>(gData->blpHeader.Offset[0]) + pixels;
+
+    if (alphaOffset > 0xFFFFFFFFull)
+    {
+        *gResult = formatCannotRead;
+        return false;
+    }
+
+    *gResult = PSSDKSetFPos(
+        gFormatRecord->dataFork,
+        gFormatRecord->posixFileDescriptor,
+        gFormatRecord->pluginUsingPOSIXIO,
+        fsFromStart,
+        static_cast<int32>(alphaOffset));
+    if (*gResult != noErr)
+        return false;
+
+    std::vector<uint8> buffer(64 * 1024);
+    uint64 remaining = alphaSize;
+    while (remaining > 0 && *gResult == noErr)
+    {
+        int32 chunk = static_cast<int32>(remaining < buffer.size() ? remaining : buffer.size());
+        ReadSome(chunk, buffer.data());
+        if (*gResult != noErr)
+            return false;
+
+        for (int32 i = 0; i < chunk; i++)
+        {
+            if (buffer[i] != 0)
+                return false;
+        }
+        remaining -= static_cast<uint64>(chunk);
+    }
+
+    return (*gResult == noErr);
 }
 
 #include <setjmp.h>
@@ -590,6 +669,165 @@ GLOBAL(void) jpeg_mem_src_custom (j_decompress_ptr cinfo, const unsigned char * 
     src = (my_source_mgr *) cinfo->src;
     src->pub.bytes_in_buffer = size;
     src->pub.next_input_byte = (const JOCTET *) buffer;
+}
+
+static bool DecodeJPEGMip0ToImageBuffer(int32 width, int32 height, bool& outHasAlpha, bool& outAlphaAllZero)
+{
+    outHasAlpha = false;
+    outAlphaAllZero = true;
+
+    if (*gResult != noErr)
+        return false;
+
+    // Read JPEG header size
+    uint32 headerSize = 0;
+    *gResult = PSSDKSetFPos(
+        gFormatRecord->dataFork,
+        gFormatRecord->posixFileDescriptor,
+        gFormatRecord->pluginUsingPOSIXIO,
+        fsFromStart,
+        sizeof(BLP_HEADER));
+    if (*gResult != noErr)
+        return false;
+
+    ReadSome(4, &headerSize);
+    if (*gResult != noErr)
+        return false;
+
+    const uint32 dataSize = gData->blpHeader.Size[0];
+    const uint32 fullSize = headerSize + dataSize;
+    uint8* fullJpg = (uint8*)malloc(fullSize);
+    if (!fullJpg)
+    {
+        *gResult = memFullErr;
+        return false;
+    }
+
+    // Read JPEG header bytes (immediately after headerSize field)
+    ReadSome(headerSize, fullJpg);
+    if (*gResult != noErr)
+    {
+        free(fullJpg);
+        return false;
+    }
+
+    // Read JPEG body bytes
+    *gResult = PSSDKSetFPos(
+        gFormatRecord->dataFork,
+        gFormatRecord->posixFileDescriptor,
+        gFormatRecord->pluginUsingPOSIXIO,
+        fsFromStart,
+        gData->blpHeader.Offset[0]);
+    if (*gResult != noErr)
+    {
+        free(fullJpg);
+        return false;
+    }
+    ReadSome(dataSize, fullJpg + headerSize);
+    if (*gResult != noErr)
+    {
+        free(fullJpg);
+        return false;
+    }
+
+    if (gData->imageBuffer == NULL)
+    {
+        gData->imageBuffer = (uint8*)malloc(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+        if (!gData->imageBuffer)
+        {
+            free(fullJpg);
+            *gResult = memFullErr;
+            return false;
+        }
+        memset(gData->imageBuffer, 0, static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    }
+
+    struct jpeg_decompress_struct cinfo;
+    struct my_error_mgr jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer))
+    {
+        jpeg_destroy_decompress(&cinfo);
+        free(fullJpg);
+        *gResult = formatCannotRead;
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src_custom(&cinfo, fullJpg, fullSize);
+    (void)jpeg_read_header(&cinfo, TRUE);
+
+    if (cinfo.num_components == 4)
+    {
+        cinfo.jpeg_color_space = JCS_CMYK;
+        cinfo.out_color_space = JCS_CMYK;
+    }
+
+    (void)jpeg_start_decompress(&cinfo);
+
+    outHasAlpha = (cinfo.output_components == 4);
+    if (!outHasAlpha)
+        outAlphaAllZero = false;
+
+    int stride = cinfo.output_width * cinfo.output_components;
+    JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, stride, 1);
+
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        int row = (int)cinfo.output_scanline;
+        (void)jpeg_read_scanlines(&cinfo, buffer, 1);
+        if (row >= height)
+            continue;
+
+        uint8* dstRow = gData->imageBuffer + static_cast<size_t>(row) * static_cast<size_t>(width) * 4u;
+        int maxW = (width < (int)cinfo.output_width ? width : (int)cinfo.output_width);
+
+        if (cinfo.output_components == 4)
+        {
+            memcpy(dstRow, buffer[0], static_cast<size_t>(maxW) * 4u);
+
+            if (outAlphaAllZero)
+            {
+                // alpha 在第 4 个分量
+                for (int x = 0; x < maxW; x++)
+                {
+                    if (dstRow[x * 4 + 3] != 0)
+                    {
+                        outAlphaAllZero = false;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int x = 0; x < maxW; x++)
+            {
+                dstRow[x * 4 + 0] = buffer[0][x * 3 + 0];
+                dstRow[x * 4 + 1] = buffer[0][x * 3 + 1];
+                dstRow[x * 4 + 2] = buffer[0][x * 3 + 2];
+                dstRow[x * 4 + 3] = 255;
+            }
+        }
+    }
+
+    // Swap R/B: BGRA -> RGBA
+    for (int32 i = 0; i < width * height; i++)
+    {
+        uint8* px = gData->imageBuffer + i * 4;
+        uint8 temp = px[2];
+        px[2] = px[0];
+        px[0] = temp;
+    }
+
+    (void)jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    free(fullJpg);
+
+    return (*gResult == noErr);
 }
 
 /*****************************************************************************/
@@ -692,96 +930,10 @@ static void DoReadContinue (void)
         }
         else if (gData->blpHeader.Compression == BLP_COMPRESSION_JPEG)
         {
-             // Implement JPEG Mode Reading
-             uint32 headerSize;
-             *gResult = PSSDKSetFPos(gFormatRecord->dataFork, gFormatRecord->posixFileDescriptor, gFormatRecord->pluginUsingPOSIXIO, fsFromStart, sizeof(BLP_HEADER));
-             ReadSome(4, &headerSize);
-             if (*gResult != noErr) { return; }
-             
-             uint32 dataSize = gData->blpHeader.Size[0];
-             uint32 fullSize = headerSize + dataSize;
-             
-             uint8* fullJpg = (uint8*)malloc(fullSize);
-             if (!fullJpg) { *gResult = memFullErr; return; }
-             
-             // Read Header
-             ReadSome(headerSize, fullJpg);
-             if (*gResult != noErr) { free(fullJpg); return; }
-             
-             // Read Data
-             *gResult = PSSDKSetFPos(gFormatRecord->dataFork, gFormatRecord->posixFileDescriptor, gFormatRecord->pluginUsingPOSIXIO, fsFromStart, gData->blpHeader.Offset[0]);
-             ReadSome(dataSize, fullJpg + headerSize);
-             if (*gResult != noErr) { free(fullJpg); return; }
-             
-             // Decompress JPEG
-             struct jpeg_decompress_struct cinfo;
-             struct my_error_mgr jerr;
-             
-             cinfo.err = jpeg_std_error(&jerr.pub);
-             jerr.pub.error_exit = my_error_exit;
-             
-             if (setjmp(jerr.setjmp_buffer)) {
-                 jpeg_destroy_decompress(&cinfo);
-                 free(fullJpg);
-                 *gResult = formatCannotRead;
+             bool hasAlpha = false;
+             bool alphaAllZero = false;
+             if (!DecodeJPEGMip0ToImageBuffer(width, height, hasAlpha, alphaAllZero))
                  return;
-             }
-             
-             jpeg_create_decompress(&cinfo);
-             jpeg_mem_src_custom(&cinfo, fullJpg, fullSize);
-             (void) jpeg_read_header(&cinfo, TRUE);
-
-             // Force CMYK (Raw) mode for 4-component images.
-             // Some BLP files have JFIF markers (implying YCCK) but actually contain raw BGRA data.
-             // We must prevent libjpeg from performing YCCK->CMYK conversion in these cases.
-             if (cinfo.num_components == 4) {
-                 cinfo.jpeg_color_space = JCS_CMYK;
-                 cinfo.out_color_space = JCS_CMYK;
-             }
-
-             (void) jpeg_start_decompress(&cinfo);
-             
-             int stride = cinfo.output_width * cinfo.output_components;
-             JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr) &cinfo, JPOOL_IMAGE, stride, 1);
-             
-             while (cinfo.output_scanline < cinfo.output_height) {
-                 int row = cinfo.output_scanline;
-                 (void) jpeg_read_scanlines(&cinfo, buffer, 1);
-                 
-                 if (row >= height) continue;
-
-                 // Copy row to imageBuffer
-                 // Note: We assume 4 components (CMYK/BGRA) as per BLP spec.
-                 // If components != 4, we might need different handling, but BLP JPEG is typically 4.
-                 uint8* dstRow = gData->imageBuffer + row * width * 4;
-                 int copyLen = (width < (int)cinfo.output_width ? width : (int)cinfo.output_width) * 4;
-                 
-                 if (cinfo.output_components == 4) {
-                     memcpy(dstRow, buffer[0], copyLen);
-                 } else {
-                     // Fallback for RGB (3 components) -> RGBA
-                     for (int x = 0; x < width && x < (int)cinfo.output_width; x++) {
-                         dstRow[x*4+0] = buffer[0][x*3+0];
-                         dstRow[x*4+1] = buffer[0][x*3+1];
-                         dstRow[x*4+2] = buffer[0][x*3+2];
-                         dstRow[x*4+3] = 255;
-                     }
-                 }
-             }
-             
-             // Swap R and B (Component 0 and 2)
-             // This converts BGRA (stored as CMYK) to RGBA
-             for (int i = 0; i < width * height; i++) {
-                 uint8* px = gData->imageBuffer + i * 4;
-                 uint8 temp = px[2];
-                 px[2] = px[0];
-                 px[0] = temp;
-             }
-             
-             (void) jpeg_finish_decompress(&cinfo);
-             jpeg_destroy_decompress(&cinfo);
-             
-             free(fullJpg);
         }
     }
 
