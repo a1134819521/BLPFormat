@@ -1,0 +1,23 @@
+#pragma code_page(65001)
+#include "Dialog.rc"
+#include "BLPFormat2.pipl"
+1 VERSIONINFO
+FILEVERSION 2,0,3,0
+PRODUCTVERSION 2,0,3,0
+FILEOS 0x40004
+FILETYPE 0x2
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "BLPFormat2 - Warcraft BLP1 texture format\0"
+            VALUE "FileVersion", "2.0.3\0"
+            VALUE "ProductName", "BLPFormat2\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
